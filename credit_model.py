@@ -1,191 +1,106 @@
-"""
-Credit risk model: data loading, encoding, training and evaluation.
-
-Kept separate from the Streamlit UI (app.py) so it can be unit-tested.
-
-Target: 1 = bad credit risk, 0 = good credit risk.
-The UCI documentation gives a cost matrix in which predicting "good" for a
-customer who is actually bad costs 5, and predicting "bad" for a good customer
-costs 1. The model therefore picks a decision threshold that minimises this
-expected cost instead of using the default 0.5.
-"""
-from __future__ import annotations
-
-from dataclasses import dataclass, field
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    accuracy_score,
-    confusion_matrix,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-)
-from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import OrdinalEncoder, StandardScaler
+import shap
+from lightgbm import LGBMClassifier
+from sklearn.metrics import confusion_matrix, roc_auc_score, recall_score
 
-UCI_URL = "https://archive.ics.uci.edu/ml/machine-learning-databases/statlog/german/german.data"
-LOCAL_DATA = Path(__file__).parent / "data" / "german.data"
+# ---------------------------------------------------------------------------
+# 1. Model Training with LightGBM Support
+# ---------------------------------------------------------------------------
+def train_models(X_train, y_train, class_weight_ratio=5.0):
+    """
+    Trains Logistic Regression, Random Forest, and LightGBM with cost-sensitive weighting.
+    """
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.ensemble import RandomForestClassifier
 
-COLUMNS = [
-    "checking_account", "duration", "credit_history", "purpose",
-    "credit_amount", "savings_account", "employment", "installment_rate",
-    "personal_status", "other_debtors", "residence_since", "property",
-    "age", "other_installments", "housing", "existing_credits",
-    "job", "liable_people", "telephone", "foreign_worker", "credit_risk",
-]
-TARGET = "credit_risk"
-COST_FALSE_GOOD = 5.0  # approving a customer who defaults
-COST_FALSE_BAD = 1.0   # rejecting a customer who would have repaid
-RANDOM_STATE = 42
+    weights = {0: 1.0, 1: class_weight_ratio}
 
-
-def load_data(prefer_local: bool = True) -> tuple[pd.DataFrame, str]:
-    """Return (raw dataframe, source). Uses the bundled copy first, then UCI."""
-    sources = [str(LOCAL_DATA), UCI_URL] if prefer_local else [UCI_URL, str(LOCAL_DATA)]
-    last_error = None
-    for src in sources:
-        try:
-            if src == str(LOCAL_DATA) and not LOCAL_DATA.exists():
-                continue
-            df = pd.read_csv(src, sep=" ", header=None, names=COLUMNS)
-            validate_raw(df)
-            return df, src
-        except Exception as exc:  # network errors, missing file, bad format
-            last_error = exc
-    raise RuntimeError(f"Could not load the German Credit data: {last_error}")
-
-
-def validate_raw(df: pd.DataFrame) -> None:
-    if list(df.columns) != COLUMNS:
-        raise ValueError("Unexpected columns in German Credit data.")
-    if not set(df[TARGET].unique()) <= {1, 2}:
-        raise ValueError("Target column must contain only 1 (good) and 2 (bad).")
-
-
-def split_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
-    """Map target 1/2 to 0 (good) / 1 (bad) and return X, y."""
-    y = df[TARGET].map({1: 0, 2: 1}).astype(int)
-    X = df.drop(columns=TARGET)
-    return X, y
-
-
-@dataclass
-class CreditModel:
-    """A fitted encoder + classifier with a cost-based decision threshold."""
-
-    encoder: OrdinalEncoder
-    model: object
-    feature_names: list[str]
-    categorical: list[str]
-    threshold: float = 0.5
-    metrics: dict = field(default_factory=dict)
-
-    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        X = X[self.feature_names].copy()
-        X[self.categorical] = self.encoder.transform(X[self.categorical].astype(str))
-        return X
-
-    def predict_proba_bad(self, X: pd.DataFrame) -> np.ndarray:
-        return self.model.predict_proba(self.transform(X))[:, 1]
-
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        return (self.predict_proba_bad(X) >= self.threshold).astype(int)
-
-    @property
-    def feature_importances(self) -> pd.Series:
-        est = self.model
-        if hasattr(est, "feature_importances_"):
-            values = est.feature_importances_
-        else:  # logistic regression pipeline
-            values = np.abs(est[-1].coef_[0])
-        return pd.Series(values, index=self.feature_names).sort_values(ascending=False)
-
-
-def _make_encoder(X: pd.DataFrame, categorical: list[str]) -> OrdinalEncoder:
-    enc = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
-    enc.fit(X[categorical].astype(str))
-    return enc
-
-
-def expected_cost(y_true, y_pred) -> float:
-    """Average misclassification cost per customer under the UCI cost matrix."""
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
-    return float((fn * COST_FALSE_GOOD + fp * COST_FALSE_BAD) / len(y_true))
-
-
-def best_threshold(y_true, proba_bad) -> float:
-    """Threshold on P(bad) that minimises expected cost."""
-    grid = np.round(np.arange(0.05, 0.96, 0.01), 2)
-    costs = [expected_cost(y_true, (proba_bad >= t).astype(int)) for t in grid]
-    return float(grid[int(np.argmin(costs))])
-
-
-def evaluate(y_true, proba_bad, threshold: float) -> dict:
-    y_pred = (proba_bad >= threshold).astype(int)
-    return {
-        "roc_auc": roc_auc_score(y_true, proba_bad),
-        "accuracy": accuracy_score(y_true, y_pred),
-        "bad_recall": recall_score(y_true, y_pred, zero_division=0),
-        "bad_precision": precision_score(y_true, y_pred, zero_division=0),
-        "expected_cost": expected_cost(y_true, y_pred),
-        "threshold": threshold,
-        "confusion_matrix": confusion_matrix(y_true, y_pred, labels=[0, 1]),
+    models = {
+        "Logistic Regression": LogisticRegression(
+            class_weight=weights, max_iter=1000, random_state=42
+        ),
+        "Random Forest": RandomForestClassifier(
+            n_estimators=200, max_depth=8, class_weight=weights, random_state=42
+        ),
+        "LightGBM": LGBMClassifier(
+            n_estimators=150,
+            learning_rate=0.05,
+            max_depth=6,
+            scale_pos_weight=class_weight_ratio,
+            random_state=42,
+            verbosity=-1
+        )
     }
 
+    for name, model in models.items():
+        model.fit(X_train, y_train)
 
-def _random_forest():
-    return RandomForestClassifier(
-        n_estimators=300, max_depth=8, min_samples_leaf=3,
-        class_weight="balanced", random_state=RANDOM_STATE, n_jobs=-1,
-    )
+    return models
 
-
-def _logistic_baseline():
-    return make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000, class_weight="balanced"))
-
-
-def train(df: pd.DataFrame, test_size: float = 0.2) -> dict:
+# ---------------------------------------------------------------------------
+# 2. Local Explainability with SHAP
+# ---------------------------------------------------------------------------
+def get_shap_explanation(model, transformed_applicant_df):
     """
-    Train a Random Forest and a logistic-regression baseline.
-
-    The decision threshold is tuned on cross-validated training predictions only,
-    then both models are scored once on the held-out test set.
-    Returns {"rf": CreditModel, "baseline": CreditModel, "test": (X_test, y_test)}.
+    Computes SHAP values for a single applicant or batch using TreeExplainer.
+    Returns: explainer, shap_values
     """
-    X, y = split_features(df)
-    categorical = X.select_dtypes(include="object").columns.tolist()
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, stratify=y, random_state=RANDOM_STATE
+    # TreeExplainer is compatible with Random Forest and LightGBM
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer(transformed_applicant_df)
+
+    # For binary classification, pull values for the positive class (Bad Credit = 1)
+    if len(shap_values.values.shape) == 3:
+        # Some RF versions output (n_samples, n_features, n_classes)
+        return explainer, shap_values[:, :, 1]
+    
+    return explainer, shap_values
+
+# ---------------------------------------------------------------------------
+# 3. Algorithmic Fairness & Bias Audit
+# ---------------------------------------------------------------------------
+def compute_fairness_audit(y_true, y_pred, sensitive_series, privileged_group, unprivileged_group):
+    """
+    Computes key Fair Lending compliance metrics:
+      - Disparate Impact Ratio (80% rule compliance)
+      - Statistical Parity Difference
+      - Equal Opportunity Difference (Recall difference)
+    """
+    df_audit = pd.DataFrame({
+        "y_true": y_true,
+        "y_pred": y_pred,
+        "group": sensitive_series
+    })
+
+    # Selection rate = Rate of predicting "Good Credit" (0)
+    # (In loan approval context, Good Credit is the favorable outcome)
+    rate_priv = (df_audit[df_audit["group"] == privileged_group]["y_pred"] == 0).mean()
+    rate_unpriv = (df_audit[df_audit["group"] == unprivileged_group]["y_pred"] == 0).mean()
+
+    disparate_impact = rate_unpriv / (rate_priv + 1e-9)
+    statistical_parity_diff = rate_unpriv - rate_priv
+
+    # True Positive Rate for favorable outcome (Good credit)
+    tpr_priv = recall_score(
+        df_audit[df_audit["group"] == privileged_group]["y_true"] == 0,
+        df_audit[df_audit["group"] == privileged_group]["y_pred"] == 0,
+        zero_division=0
     )
-    encoder = _make_encoder(X_train, categorical)
+    tpr_unpriv = recall_score(
+        df_audit[df_audit["group"] == unprivileged_group]["y_true"] == 0,
+        df_audit[df_audit["group"] == unprivileged_group]["y_pred"] == 0,
+        zero_division=0
+    )
+    equal_opportunity_diff = tpr_unpriv - tpr_priv
 
-    def encode(frame):
-        frame = frame.copy()
-        frame[categorical] = encoder.transform(frame[categorical].astype(str))
-        return frame
-
-    Xtr, Xte = encode(X_train), encode(X_test)
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
-    results = {}
-    for name, factory in (("rf", _random_forest), ("baseline", _logistic_baseline)):
-        # Out-of-fold probabilities on the training set -> threshold (no test leakage).
-        oof = np.zeros(len(Xtr))
-        for tr_idx, va_idx in cv.split(Xtr, y_train):
-            m = factory().fit(Xtr.iloc[tr_idx], y_train.iloc[tr_idx])
-            oof[va_idx] = m.predict_proba(Xtr.iloc[va_idx])[:, 1]
-        threshold = best_threshold(y_train.values, oof)
-        cv_auc = cross_val_score(factory(), Xtr, y_train, cv=cv, scoring="roc_auc")
-
-        model = factory().fit(Xtr, y_train)
-        metrics = evaluate(y_test.values, model.predict_proba(Xte)[:, 1], threshold)
-        metrics["cv_auc_mean"] = float(cv_auc.mean())
-        metrics["cv_auc_std"] = float(cv_auc.std())
-        results[name] = CreditModel(encoder, model, X.columns.tolist(), categorical, threshold, metrics)
-    results["test"] = (X_test, y_test)
-    return results
+    return {
+        "Privileged Group": privileged_group,
+        "Unprivileged Group": unprivileged_group,
+        "Approval Rate (Privileged)": round(rate_priv, 3),
+        "Approval Rate (Unprivileged)": round(rate_unpriv, 3),
+        "Disparate Impact Ratio": round(disparate_impact, 3),
+        "Passes 80% Rule": "Yes" if 0.80 <= disparate_impact <= 1.25 else "No",
+        "Statistical Parity Diff": round(statistical_parity_diff, 3),
+        "Equal Opportunity Diff": round(equal_opportunity_diff, 3)
+    }
