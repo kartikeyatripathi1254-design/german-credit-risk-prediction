@@ -9,3 +9,9 @@ seaborn>=0.12
 jupyter>=1.0
 # Tests
 pytest>=8.0
+# Add these lines to requirements.txt
+lightgbm>=4.0.0
+shap>=0.44.0
+fastapi>=0.109.0
+uvicorn>=0.27.0
+pydantic>=2.0.0
