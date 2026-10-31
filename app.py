@@ -11,16 +11,9 @@ Deploy: streamlit run app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import (
-    accuracy_score, classification_report, confusion_matrix
-)
 import matplotlib.pyplot as plt
 import seaborn as sns
-import warnings
-warnings.filterwarnings("ignore")
+import credit_model as cm
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -72,63 +65,18 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ── Load and prepare data ─────────────────────────────────────────────────────
+# ── Load data and train models (logic lives in credit_model.py) ─────────────
 @st.cache_data
 def load_data():
-    """
-    Load UCI German Credit Dataset.
-    Downloads directly from UCI ML Repository — the original real source.
-    """
-    url = "https://archive.ics.uci.edu/ml/machine-learning-databases/statlog/german/german.data"
-
-    column_names = [
-        "checking_account", "duration", "credit_history", "purpose",
-        "credit_amount", "savings_account", "employment", "installment_rate",
-        "personal_status", "other_debtors", "residence_since", "property",
-        "age", "other_installments", "housing", "existing_credits",
-        "job", "liable_people", "telephone", "foreign_worker", "credit_risk"
-    ]
-
     try:
-        df = pd.read_csv(url, sep=" ", header=None, names=column_names)
-        return df, None
-    except Exception as e:
+        return cm.load_data()
+    except RuntimeError as e:
         return None, str(e)
 
 
-@st.cache_data
-def prepare_model(df):
-    """Clean data, encode categoricals, train Random Forest model."""
-    df = df.copy()
-
-    # Convert target: 1 = Good, 2 = Bad → 0 = Good, 1 = Bad
-    df["credit_risk"] = df["credit_risk"].map({1: 0, 2: 1})
-
-    # Encode all categorical (object) columns
-    le = LabelEncoder()
-    cat_cols = df.select_dtypes(include="object").columns
-    for col in cat_cols:
-        df[col] = le.fit_transform(df[col].astype(str))
-
-    X = df.drop("credit_risk", axis=1)
-    y = df["credit_risk"]
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
-
-    model = RandomForestClassifier(
-        n_estimators=100, max_depth=8,
-        random_state=42, class_weight="balanced"
-    )
-    model.fit(X_train, y_train)
-
-    y_pred = model.predict(X_test)
-    accuracy = accuracy_score(y_test, y_pred)
-    report = classification_report(y_test, y_pred, output_dict=True)
-    cm = confusion_matrix(y_test, y_pred)
-
-    return model, X, X_train, X_test, y_test, y_pred, accuracy, report, cm
+@st.cache_resource
+def train_models(df):
+    return cm.train(df)
 
 
 # ── Sidebar navigation ────────────────────────────────────────────────────────
@@ -158,25 +106,21 @@ Pandas · Seaborn
 """)
 
 # ── Load data ─────────────────────────────────────────────────────────────────
-df, load_error = load_data()
+df, data_source = load_data()
 
-if load_error:
-    st.error(f"Could not load data from UCI: {load_error}")
-    st.info("Upload your german.data file below as a fallback.")
-    uploaded = st.file_uploader("Upload german.data file", type=["data", "csv"])
+if df is None:
+    st.error(f"Could not load the dataset: {data_source}")
+    uploaded = st.file_uploader("Upload the UCI german.data file", type=["data", "csv", "txt"])
     if uploaded:
-        column_names = [
-            "checking_account", "duration", "credit_history", "purpose",
-            "credit_amount", "savings_account", "employment", "installment_rate",
-            "personal_status", "other_debtors", "residence_since", "property",
-            "age", "other_installments", "housing", "existing_credits",
-            "job", "liable_people", "telephone", "foreign_worker", "credit_risk"
-        ]
-        df = pd.read_csv(uploaded, sep=" ", header=None, names=column_names)
+        df = pd.read_csv(uploaded, sep=" ", header=None, names=cm.COLUMNS)
+        cm.validate_raw(df)
     else:
         st.stop()
 
-model, X, X_train, X_test, y_test, y_pred, accuracy, report, cm = prepare_model(df)
+results = train_models(df)
+rf, baseline = results["rf"], results["baseline"]
+m = rf.metrics
+X = df.drop(columns=cm.TARGET)
 
 # ── PAGE: Overview ────────────────────────────────────────────────────────────
 if page == "🏠 Overview":
@@ -193,7 +137,7 @@ if page == "🏠 Overview":
         bad = (df["credit_risk"] == 2).sum()
         st.metric("Bad Credit", f"{bad:,}", f"{bad/len(df)*100:.0f}%")
     with col4:
-        st.metric("Model Accuracy", f"{accuracy*100:.1f}%")
+        st.metric("ROC-AUC (test set)", f"{m['roc_auc']:.2f}")
 
     st.markdown("---")
 
@@ -211,16 +155,18 @@ if page == "🏠 Overview":
         **Pipeline:**
         1. Load real data from UCI ML Repository
         2. Clean and encode 20 features
-        3. Train a Random Forest classifier
-        4. Evaluate model performance
-        5. Accept new inputs and predict risk in real time
+        3. Train a Random Forest and a logistic-regression baseline
+        4. Evaluate with ROC-AUC, bad-loan recall and 5-fold cross-validation
+        5. Choose the decision threshold that minimises the cost of wrong decisions
+        6. Accept new inputs and predict risk in real time
         """)
 
     with col_r:
         st.markdown("### Credit Risk Distribution")
         fig, ax = plt.subplots(figsize=(5, 3))
-        labels = ["Good Credit (70%)", "Bad Credit (30%)"]
-        sizes = [700, 300]
+        counts = df[cm.TARGET].map({1: "Good Credit", 2: "Bad Credit"}).value_counts()
+        labels = [f"{k} ({v / len(df):.0%})" for k, v in counts.items()]
+        sizes = counts.values
         colors = ["#0A9396", "#E63946"]
         ax.pie(sizes, labels=labels, colors=colors, autopct="%1.0f%%",
                startangle=90, textprops={"fontsize": 11})
@@ -231,16 +177,16 @@ if page == "🏠 Overview":
 # ── PAGE: Data Explorer ───────────────────────────────────────────────────────
 elif page == "📊 Data Explorer":
     st.markdown("## 📊 Data Explorer")
-    st.caption("UCI Statlog German Credit Dataset — 1,000 customers, 20 features")
+    st.caption(f"UCI Statlog German Credit Dataset — {len(df):,} customers, {X.shape[1]} features")
 
     tab1, tab2, tab3 = st.tabs(["Raw Data", "Statistics", "Distributions"])
 
     with tab1:
-        st.dataframe(df.head(50), use_container_width=True)
+        st.dataframe(df.head(50), width="stretch")
         st.caption(f"Showing 50 of {len(df):,} rows · {df.shape[1]} columns")
 
     with tab2:
-        st.dataframe(df.describe().round(2), use_container_width=True)
+        st.dataframe(df.describe().round(2), width="stretch")
 
     with tab3:
         col1, col2 = st.columns(2)
@@ -273,52 +219,60 @@ elif page == "📊 Data Explorer":
 # ── PAGE: ML Model ────────────────────────────────────────────────────────────
 elif page == "🤖 ML Model":
     st.markdown("## 🤖 Machine Learning Model")
-    st.caption("Random Forest Classifier · 80/20 train-test split · Class balanced")
+    st.caption(
+        "Random Forest vs logistic-regression baseline · stratified 80/20 split · "
+        "5-fold cross-validation · cost-based decision threshold"
+    )
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Accuracy", f"{accuracy*100:.1f}%")
-    with col2:
-        precision = report["1"]["precision"]
-        st.metric("Bad Credit Precision", f"{precision*100:.1f}%")
-    with col3:
-        recall = report["1"]["recall"]
-        st.metric("Bad Credit Recall", f"{recall*100:.1f}%")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("ROC-AUC (test)", f"{m['roc_auc']:.2f}", help="How well the model ranks bad loans above good ones")
+    col2.metric("Bad-loan recall", f"{m['bad_recall']:.0%}", help="Share of actual bad loans the model catches")
+    col3.metric("Bad-loan precision", f"{m['bad_precision']:.0%}")
+    col4.metric("CV ROC-AUC", f"{m['cv_auc_mean']:.2f} ± {m['cv_auc_std']:.2f}")
 
-    st.markdown("---")
+    st.info(
+        f"Missing a bad loan costs 5× more than rejecting a good customer (UCI cost matrix), "
+        f"so the model flags a customer as bad when P(bad) ≥ **{rf.threshold:.2f}** instead of 0.50. "
+        f"This trades some accuracy ({m['accuracy']:.0%}) for catching more defaults."
+    )
+
+    st.markdown("### Random Forest vs baseline")
+    comp = pd.DataFrame({
+        name: {
+            "ROC-AUC (test)": f"{mod.metrics['roc_auc']:.3f}",
+            "CV ROC-AUC": f"{mod.metrics['cv_auc_mean']:.3f} ± {mod.metrics['cv_auc_std']:.3f}",
+            "Bad-loan recall": f"{mod.metrics['bad_recall']:.0%}",
+            "Bad-loan precision": f"{mod.metrics['bad_precision']:.0%}",
+            "Accuracy": f"{mod.metrics['accuracy']:.0%}",
+            "Expected cost / customer": f"{mod.metrics['expected_cost']:.3f}",
+            "Threshold": f"{mod.threshold:.2f}",
+        }
+        for name, mod in (("Random Forest", rf), ("Logistic regression (baseline)", baseline))
+    })
+    st.dataframe(comp, width="stretch")
 
     col_l, col_r = st.columns(2)
-
     with col_l:
-        st.markdown("### Confusion Matrix")
+        st.markdown("### Confusion Matrix (test set)")
         fig, ax = plt.subplots(figsize=(5, 4))
         sns.heatmap(
-            cm, annot=True, fmt="d", cmap="Blues", ax=ax,
+            m["confusion_matrix"], annot=True, fmt="d", cmap="Blues", ax=ax,
             xticklabels=["Good Credit", "Bad Credit"],
             yticklabels=["Good Credit", "Bad Credit"]
         )
         ax.set_ylabel("Actual")
         ax.set_xlabel("Predicted")
-        ax.set_title("Confusion Matrix", fontweight="bold")
         st.pyplot(fig)
         plt.close()
 
     with col_r:
         st.markdown("### Feature Importance (Top 10)")
-        importances = pd.Series(
-            model.feature_importances_, index=X.columns
-        ).sort_values(ascending=True).tail(10)
-
+        importances = rf.feature_importances.head(10).sort_values()
         fig, ax = plt.subplots(figsize=(5, 4))
         importances.plot(kind="barh", ax=ax, color="#0A9396")
-        ax.set_title("Top 10 Important Features", fontweight="bold")
         ax.set_xlabel("Importance Score")
         st.pyplot(fig)
         plt.close()
-
-    st.markdown("### Full Classification Report")
-    report_df = pd.DataFrame(report).transpose().round(2)
-    st.dataframe(report_df, use_container_width=True)
 
 # ── PAGE: Predict ─────────────────────────────────────────────────────────────
 elif page == "🔮 Predict Risk":
@@ -370,19 +324,19 @@ elif page == "🔮 Predict Risk":
             ])
             liable_people = st.selectbox("Number of Liable People", [1, 2])
 
-        submitted = st.form_submit_button("🔮 Predict Credit Risk", use_container_width=True)
+        submitted = st.form_submit_button("🔮 Predict Credit Risk", width="stretch")
 
     if submitted:
         # Build input row matching training feature order
         # Using median/mode values for features not collected in form
         input_data = {
-            "checking_account": [checking_account[:3]],
+            "checking_account": [checking_account.split(" ")[0]],
             "duration": [duration],
-            "credit_history": [credit_history[:3]],
-            "purpose": [purpose[:3]],
+            "credit_history": [credit_history.split(" ")[0]],
+            "purpose": [purpose.split(" ")[0]],
             "credit_amount": [credit_amount],
-            "savings_account": [savings_account[:3]],
-            "employment": [employment[:3]],
+            "savings_account": [savings_account.split(" ")[0]],
+            "employment": [employment.split(" ")[0]],
             "installment_rate": [installment_rate],
             "personal_status": ["A93"],       # male single (most common)
             "other_debtors": ["A101"],         # none
@@ -390,9 +344,9 @@ elif page == "🔮 Predict Risk":
             "property": ["A121"],              # real estate
             "age": [age],
             "other_installments": ["A143"],    # none
-            "housing": [housing[:4]],
+            "housing": [housing.split(" ")[0]],
             "existing_credits": [existing_credits],
-            "job": [job[:4]],
+            "job": [job.split(" ")[0]],
             "liable_people": [liable_people],
             "telephone": ["A192"],             # yes
             "foreign_worker": ["A201"],        # yes
@@ -400,18 +354,9 @@ elif page == "🔮 Predict Risk":
 
         input_df = pd.DataFrame(input_data)
 
-        # Encode to match training
-        le = LabelEncoder()
-        for col in input_df.select_dtypes(include="object").columns:
-            # Fit on the original column from training data
-            le.fit(df[col].astype(str))
-            try:
-                input_df[col] = le.transform(input_df[col].astype(str))
-            except ValueError:
-                input_df[col] = 0  # unseen label fallback
-
-        prediction = model.predict(input_df)[0]
-        probability = model.predict_proba(input_df)[0]
+        p_bad = float(rf.predict_proba_bad(input_df)[0])
+        prediction = int(p_bad >= rf.threshold)
+        probability = [1 - p_bad, p_bad]
 
         st.markdown("---")
         st.markdown("### Prediction Result")
@@ -448,12 +393,11 @@ elif page == "🔮 Predict Risk":
             plt.close()
 
         # Risk factors
-        st.markdown("### Key Risk Factors for This Customer")
-        importances = pd.Series(model.feature_importances_, index=X.columns)
-        top_factors = importances.sort_values(ascending=False).head(5)
-        for feat, score in top_factors.items():
-            val = input_df[feat].values[0] if feat in input_df.columns else "N/A"
-            st.markdown(f"- **{feat.replace('_', ' ').title()}**: importance score `{score:.3f}`")
+        st.caption(f"Flagged as bad when P(bad) ≥ {rf.threshold:.2f} (cost-based threshold).")
+        st.markdown("### Most influential features overall")
+        st.caption("These are global model importances, not an explanation of this single prediction.")
+        for feat, score in rf.feature_importances.head(5).items():
+            st.markdown(f"- **{feat.replace('_', ' ').title()}**: importance `{score:.3f}`")
 
 # ── PAGE: About ───────────────────────────────────────────────────────────────
 elif page == "📋 About":
@@ -484,10 +428,12 @@ elif page == "📋 About":
     | Visualisation | Matplotlib, Seaborn |
 
     ### Model Details
-    - **Algorithm:** Random Forest Classifier (100 trees, max depth 8)
-    - **Train/Test Split:** 80% / 20%
-    - **Class balancing:** Enabled (handles 70/30 class imbalance)
-    - **Accuracy:** ~75–78% on test set
+    - **Algorithm:** Random Forest (300 trees, max depth 8), compared with a logistic-regression baseline
+    - **Validation:** stratified 80/20 split plus 5-fold cross-validation on the training set
+    - **Class balancing:** enabled (the data is 70% good / 30% bad)
+    - **Decision threshold:** tuned on out-of-fold training predictions to minimise the UCI cost
+      matrix (a missed bad loan costs 5, a rejected good customer costs 1)
+    - **Results:** shown live on the ML Model page
 
     ### Business Relevance
     Credit risk assessment is critical for German banks and financial institutions.
@@ -496,6 +442,5 @@ elif page == "📋 About":
     reviewers in the loop for borderline cases.
 
     ### Author
-    Built as a portfolio project demonstrating financial data analytics and ML
-    skills relevant to the German B2B market.
+    Built by Kartikeya Tripathi as a portfolio project in financial data analytics and ML.
     """)
