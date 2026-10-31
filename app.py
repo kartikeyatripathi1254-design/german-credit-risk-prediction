@@ -444,3 +444,88 @@ elif page == "📋 About":
     ### Author
     Built by Kartikeya Tripathi as a portfolio project in financial data analytics and ML.
     """)
+import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import shap
+from credit_model import get_shap_explanation, compute_fairness_audit
+
+# ---------------------------------------------------------------------------
+# Feature A: Local SHAP Explanation in the "Predict Risk" section
+# ---------------------------------------------------------------------------
+def render_shap_explanation(model, preprocessed_applicant_df, feature_names):
+    st.subheader("💡 Why this decision? (Local SHAP Explanation)")
+    
+    explainer, shap_vals = get_shap_explanation(model, preprocessed_applicant_df)
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    # Waterfall plot for single observation
+    shap.plots.waterfall(shap_vals[0], max_display=8, show=False)
+    plt.tight_layout()
+    st.pyplot(fig)
+    plt.clf()
+    st.caption("Positive SHAP values push toward **Bad Credit (High Risk)**; negative values push toward **Good Credit**.")
+
+# ---------------------------------------------------------------------------
+# Feature B: Batch Scoring via CSV Upload
+# ---------------------------------------------------------------------------
+def render_batch_prediction_tab(pipeline, optimal_threshold):
+    st.subheader("📂 Batch Applicant Risk Assessment")
+    st.markdown("Upload a CSV file containing multiple applicant records to evaluate them in bulk.")
+
+    uploaded_file = st.file_uploader("Upload Applicants CSV", type=["csv"])
+    if uploaded_file is not None:
+        batch_df = pd.read_csv(uploaded_file)
+        st.write(f"Loaded **{len(batch_df)}** records.")
+
+        if st.button("Score Batch"):
+            with st.spinner("Evaluating applicants..."):
+                probabilities = pipeline.predict_proba(batch_df)[:, 1]
+                decisions = np.where(probabilities >= optimal_threshold, "High Risk (Reject)", "Low Risk (Approve)")
+
+                results_df = batch_df.copy()
+                results_df["Default_Probability"] = probabilities.round(4)
+                results_df["Risk_Classification"] = decisions
+
+                col1, col2 = st.columns(2)
+                col1.metric("Approved Loans", int((decisions == "Low Risk (Approve)").sum()))
+                col2.metric("Rejected Loans", int((decisions == "High Risk (Reject)").sum()))
+
+                st.dataframe(results_df.head(20))
+
+                csv_data = results_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    label="📥 Download Scored CSV",
+                    data=csv_data,
+                    file_name="scored_credit_applicants.csv",
+                    mime="text/csv"
+                )
+
+# ---------------------------------------------------------------------------
+# Feature C: Fairness & Regulatory Bias Audit Tab
+# ---------------------------------------------------------------------------
+def render_fairness_tab(y_test, y_pred, df_test):
+    st.subheader("⚖️ Regulatory & Algorithmic Fairness Audit")
+    st.markdown("""
+    Under the **Equal Credit Opportunity Act (ECOA)** and EU regulations, credit scoring 
+    must not demonstrate adverse impact or unfair bias against protected demographic groups.
+    """)
+
+    # Audit by Age: e.g. Young (< 25) vs Older (>= 25)
+    age_groups = np.where(df_test["age"] < 25, "Age < 25 (Unprivileged)", "Age >= 25 (Privileged)")
+    audit_results = compute_fairness_audit(
+        y_true=y_test,
+        y_pred=y_pred,
+        sensitive_series=age_groups,
+        privileged_group="Age >= 25 (Privileged)",
+        unprivileged_group="Age < 25 (Unprivileged)"
+    )
+
+    st.write("### Age Demographics Audit")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Disparate Impact Ratio", audit_results["Disparate Impact Ratio"])
+    col2.metric("Passes 80% Rule?", audit_results["Passes 80% Rule"])
+    col3.metric("Equal Opportunity Diff", audit_results["Equal Opportunity Diff"])
+
+    st.table(pd.DataFrame([audit_results]).T.rename(columns={0: "Audit Metric Value"}))
